@@ -33,18 +33,21 @@ async function createToken(payload, secret) {
 // ----------------------------
 let SUBS_CACHE = null;
 let SUBS_CACHE_TIME = 0;
-const CACHE_TTL = 60000; // 1 دقيقة
+const CACHE_TTL = 0; // اجعلها 0 مؤقتًا للتشخيص
 
 async function fetchSubscriptionsFromGithub(rawUrl) {
     const now = Date.now();
     if (SUBS_CACHE && (now - SUBS_CACHE_TIME) < CACHE_TTL) return SUBS_CACHE;
 
+    console.log("[fetchSubscriptionsFromGithub] Fetching from GitHub:", rawUrl);
     const headers = { "Authorization": `token ${process.env.GITHUB_TOKEN}` };
     const res = await fetch(rawUrl, { headers });
 
     if (!res.ok) throw new Error(`GitHub fetch failed: ${res.status}`);
 
     const json = await res.json();
+    console.log("[fetchSubscriptionsFromGithub] JSON fetched:", JSON.stringify(json, null, 2));
+
     SUBS_CACHE = json;
     SUBS_CACHE_TIME = now;
 
@@ -70,26 +73,43 @@ module.exports = async (request, response) => {
 
     try {
         const { rin } = request.body;
+        console.log("[check-subscription] RIN received:", rin);
+
         if (!rin) return response.status(400).json({ success: false, error: 'RIN is required' });
 
         const RAW_URL = "https://raw.githubusercontent.com/ms0223048/eta-subscriptions/main/subscriptions.json";
         const data = await fetchSubscriptionsFromGithub(RAW_URL);
 
-        // مقارنة RIN بشكل صحيح بغض النظر عن النوع
-        const userSubscription = (data.subscriptions || []).find(sub => String(sub.rin) === String(rin));
-
-        if (!userSubscription || new Date(userSubscription.expiry_date) < new Date()) {
-            const reason = (!userSubscription) ? "User not found" : "Subscription expired";
-            console.log(`[check-subscription] DENIED: ${reason}`);
-            return response.status(403).json({ success: false, error: `Access denied: ${reason}` });
+        if (!data || !data.subscriptions) {
+            console.log("[check-subscription] ERROR: subscriptions key missing or empty in JSON");
+            return response.status(500).json({ success: false, error: 'Subscriptions data missing.' });
         }
 
-        // إنشاء توكن
+        console.log("[check-subscription] Total subscriptions fetched:", data.subscriptions.length);
+
+        // مقارنة RIN بشكل صحيح بغض النظر عن النوع
+        const userSubscription = data.subscriptions.find(sub => {
+            console.log("[check-subscription] Comparing RIN:", sub.rin, "with", rin);
+            return String(sub.rin) === String(rin);
+        });
+
+        if (!userSubscription) {
+            console.log("[check-subscription] User not found in subscriptions.json");
+            return response.status(403).json({ success: false, error: 'Access denied: User not found' });
+        }
+
+        if (new Date(userSubscription.expiry_date) < new Date()) {
+            console.log("[check-subscription] Subscription expired for RIN:", rin);
+            return response.status(403).json({ success: false, error: 'Access denied: Subscription expired' });
+        }
+
+        console.log("[check-subscription] User valid → creating token");
+
         const now = Math.floor(Date.now() / 1000);
         const payload = { rin: userSubscription.rin, iat: now, exp: now + 24 * 60 * 60 };
         const sessionToken = await createToken(payload, JWT_SECRET);
 
-        console.log("[check-subscription] Token created successfully.");
+        console.log("[check-subscription] Token created successfully:", sessionToken);
         return response.status(200).json({ success: true, session_token: sessionToken });
 
     } catch (error) {
