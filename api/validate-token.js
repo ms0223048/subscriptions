@@ -1,5 +1,10 @@
-// الملف: /api/validate-token.js (النسخة النهائية الكاملة)
+// الملف: /api/validate-token.js — النسخة المصححة بالكامل
 
+const fetch = global.fetch || require('node-fetch');
+
+// ----------------------------
+//   CORS Settings
+// ----------------------------
 const allowCors = (req, res) => {
     res.setHeader('Access-Control-Allow-Credentials', 'true');
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -7,14 +12,20 @@ const allowCors = (req, res) => {
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 };
 
+// ----------------------------
+//  Token Verification
+// ----------------------------
 async function verifyToken(token, secret) {
     const [encodedHeader, encodedPayload, signature] = token.split('.');
     if (!encodedHeader || !encodedPayload || !signature) {
         throw new Error('Invalid token format');
     }
+
     const data = `${encodedHeader}.${encodedPayload}`;
     const crypto = require('crypto');
-    const expectedSignature = crypto.createHmac('sha256', secret).update(data).digest('base64url');
+    const expectedSignature = crypto.createHmac('sha256', secret)
+        .update(data)
+        .digest('base64url');
 
     if (signature !== expectedSignature) {
         throw new Error('Invalid signature');
@@ -24,75 +35,106 @@ async function verifyToken(token, secret) {
     if (payload.exp < Math.floor(Date.now() / 1000)) {
         throw new Error('Token expired');
     }
+
     return payload;
 }
 
+// ----------------------------
+//   GitHub Fetch + Caching
+// ----------------------------
+let SUBS_CACHE = null;
+let SUBS_CACHE_TIME = 0;
+const CACHE_TTL = 60000; // 1 دقيقة
+
+async function fetchSubscriptionsFromGithub(rawUrl) {
+    const now = Date.now();
+
+    if (SUBS_CACHE && (now - SUBS_CACHE_TIME) < CACHE_TTL) {
+        return SUBS_CACHE;
+    }
+
+    const headers = {
+        "Authorization": `token ${process.env.GITHUB_TOKEN}`
+    };
+
+    const res = await fetch(rawUrl, { headers });
+
+    if (!res.ok) {
+        throw new Error(`GitHub fetch failed: ${res.status}`);
+    }
+
+    const json = await res.json();
+    SUBS_CACHE = json;
+    SUBS_CACHE_TIME = now;
+
+    return json;
+}
+
+// ----------------------------
+//       MAIN HANDLER
+// ----------------------------
 module.exports = async (request, response) => {
     console.log("\n--- [validate-token] Received a new request ---");
     allowCors(request, response);
 
-    // ✅ ترويسات منع التخزين المؤقت
     response.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     response.setHeader('Pragma', 'no-cache');
     response.setHeader('Expires', '0');
 
-    if (request.method === 'OPTIONS') {
-        return response.status(200).end();
-    }
+    if (request.method === 'OPTIONS') return response.status(200).end();
     if (request.method !== 'POST') {
         return response.status(405).json({ success: false, error: 'Only POST is allowed' });
     }
 
-    const BIN_ID = '6918dafcd0ea881f40eaa45b';
-    const ACCESS_KEY = '$2a$10$rXrBfSrwkJ60zqKQInt5.eVxCq14dTw9vQX8LXcpnWb7SJ5ZLNoKe';
     const JWT_SECRET = process.env.JWT_SECRET;
-
     if (!JWT_SECRET) {
-        console.error("[validate-token] FATAL ERROR: JWT_SECRET is not set.");
+        console.error("[validate-token] FATAL: JWT_SECRET is not set.");
         return response.status(500).json({ success: false, error: 'Server configuration error.' });
     }
 
     try {
         const authHeader = request.headers.authorization;
         if (!authHeader || !authHeader.startsWith('Bearer ')) {
-            console.log("[validate-token] Error: Authorization header missing.");
             return response.status(401).json({ success: false, error: 'Authorization header missing.' });
         }
-        const token = authHeader.split(' ')[1];
 
+        const token = authHeader.split(' ')[1];
         const payload = await verifyToken(token, JWT_SECRET);
         const rin = payload.rin;
-        console.log(`[validate-token] Token is technically valid for RIN: ${rin}`);
+        console.log(`[validate-token] Token valid for RIN: ${rin}`);
 
-        const binResponse = await fetch(`https://api.jsonbin.io/v3/b/${BIN_ID}/latest`, {
-            headers: { 'X-Access-Key': ACCESS_KEY }
-        } );
-        console.log(`[validate-token] Fetched from jsonbin, status: ${binResponse.status}`);
+        // ----------------------------
+        //  Fetch Subscription From GitHub
+        // ----------------------------
+        const RAW_URL = "https://raw.githubusercontent.com/ms0223048/eta-subscriptions/main/subscriptions.json";
+        const data = await fetchSubscriptionsFromGithub(RAW_URL);
 
-        if (!binResponse.ok) {
-            console.log("[validate-token] Error: Failed to fetch from jsonbin during validation.");
-            return response.status(500).json({ success: false, error: 'Failed to fetch subscription data during validation.' });
-        }
+        // تحقق من وجود RIN في JSON
+        const userSubscription = (data.subscriptions || []).find(sub => sub.rin === rin);
 
-        const data = await binResponse.json();
-        const userSubscription = (data.record?.subscriptions || []).find(sub => sub.rin === rin);
-
-        if (!userSubscription || new Date(userSubscription.expiry_date) < new Date()) {
-            console.log(`[validate-token] Access Denied: Subscription for ${rin} is no longer valid in bin.`);
+        if (!userSubscription) {
+            console.log(`[validate-token] Access Denied: User not found in subscriptions.json`);
             return response.status(401).json({ success: false, error: 'Subscription is no longer valid.' });
         }
-        
-        console.log(`[validate-token] Subscription for ${rin} is still valid. Granting access.`);
+
+        // تحقق من انتهاء الاشتراك
+        if (new Date(userSubscription.expiry_date) < new Date()) {
+            console.log(`[validate-token] Access Denied: Subscription expired for RIN: ${rin}`);
+            return response.status(401).json({ success: false, error: 'Subscription has expired.' });
+        }
+
+        console.log(`[validate-token] Subscription valid. Returning JSON data.`);
+
+        // ----------------------------
+        //  SUCCESS RESPONSE (بيانات JSON الحقيقية)
+        // ----------------------------
         return response.status(200).json({
             success: true,
-            data: {
-                seller: { name: "Authenticated User", id: payload.rin },
-                devices: []
-            }
+            data: userSubscription
         });
 
     } catch (error) {
-        console.error("[validate-token] CATCH BLOCK ERROR:", error.message);
+        console.error("[validate-token] ERROR:", error.message);
         return response.status(401).json({ success: false, error: error.message });
     }
 };
