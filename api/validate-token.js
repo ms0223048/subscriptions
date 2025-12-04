@@ -20,12 +20,10 @@ async function verifyToken(token, secret) {
     const data = `${encodedHeader}.${encodedPayload}`;
     const crypto = require('crypto');
     const expectedSignature = crypto.createHmac('sha256', secret).update(data).digest('base64url');
-
     if (signature !== expectedSignature) throw new Error('Invalid signature');
 
     const payload = JSON.parse(Buffer.from(encodedPayload, 'base64url').toString());
     if (payload.exp < Math.floor(Date.now() / 1000)) throw new Error('Token expired');
-
     return payload;
 }
 
@@ -34,22 +32,18 @@ async function verifyToken(token, secret) {
 // ----------------------------
 let SUBS_CACHE = null;
 let SUBS_CACHE_TIME = 0;
-const CACHE_TTL = 60000;
+const CACHE_TTL = 60000; // 1 دقيقة
 
 async function fetchSubscriptionsFromGithub(rawUrl) {
-    console.log("Fetching subscriptions from GitHub...");
     const now = Date.now();
     if (SUBS_CACHE && (now - SUBS_CACHE_TIME) < CACHE_TTL) return SUBS_CACHE;
 
-    const headers = { "Authorization": `token ${process.env.GITHUB_TOKEN}` };
-    const res = await fetch(rawUrl, { headers });
+    console.log("[validate-token] Fetching subscriptions from GitHub:", rawUrl);
+    const res = await fetch(rawUrl);
     if (!res.ok) throw new Error(`GitHub fetch failed: ${res.status}`);
-
     const json = await res.json();
     SUBS_CACHE = json;
     SUBS_CACHE_TIME = now;
-
-    console.log("Subscriptions fetched:", json.subscriptions.map(s => s.rin));
     return json;
 }
 
@@ -79,15 +73,21 @@ module.exports = async (request, response) => {
         const rin = payload.rin;
         console.log("[validate-token] Token valid for RIN:", rin);
 
-        const RAW_URL = "https://raw.githubusercontent.com/ms0223048/eta-subscriptions/main/subscriptions.json";
+        const RAW_URL = "https://raw.githubusercontent.com/ms0223048/subscriptions2/refs/heads/main/subscriptions.json";
         const data = await fetchSubscriptionsFromGithub(RAW_URL);
 
-        const userSubscription = (data.subscriptions || []).find(sub => String(sub.rin).trim() === String(rin).trim());
+        const userSubscription = (data.subscriptions || []).find(sub => sub.rin === rin);
+        if (!userSubscription) {
+            console.log("[validate-token] Access Denied: User not found in subscriptions.json");
+            return response.status(401).json({ success: false, error: 'Subscription is no longer valid.' });
+        }
 
-        if (!userSubscription) return response.status(401).json({ success: false, error: 'Subscription is no longer valid.' });
-        if (new Date(userSubscription.expiry_date) < new Date()) return response.status(401).json({ success: false, error: 'Subscription has expired.' });
+        if (new Date(userSubscription.expiry_date) < new Date()) {
+            console.log("[validate-token] Access Denied: Subscription expired for RIN:", rin);
+            return response.status(401).json({ success: false, error: 'Subscription has expired.' });
+        }
 
-        console.log("[validate-token] Subscription valid. Returning data.");
+        console.log("[validate-token] Subscription valid. Returning JSON data.");
         return response.status(200).json({ success: true, data: userSubscription });
 
     } catch (error) {
