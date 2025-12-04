@@ -1,7 +1,9 @@
+// FILE: /api/validate-token.js
+const crypto = require('crypto');
 const fetch = global.fetch || require('node-fetch');
 
 // ----------------------------
-//   CORS Settings
+//   CORS
 // ----------------------------
 const allowCors = (req, res) => {
     res.setHeader('Access-Control-Allow-Credentials', 'true');
@@ -11,98 +13,82 @@ const allowCors = (req, res) => {
 };
 
 // ----------------------------
-//  Token Verification
+//   Verify Token
 // ----------------------------
-async function verifyToken(token, secret) {
-    const [encodedHeader, encodedPayload, signature] = token.split('.');
-    if (!encodedHeader || !encodedPayload || !signature) throw new Error('Invalid token format');
+function verifyToken(token, secret) {
+    const [header, payload, signature] = token.split('.');
 
-    const data = `${encodedHeader}.${encodedPayload}`;
-    const crypto = require('crypto');
-    const expectedSignature = crypto.createHmac('sha256', secret).update(data).digest('base64url');
+    if (!header || !payload || !signature) throw new Error("Invalid token format");
 
-    if (signature !== expectedSignature) throw new Error('Invalid signature');
+    const checkSig = crypto
+        .createHmac("sha256", secret)
+        .update(`${header}.${payload}`)
+        .digest("base64url");
 
-    const payload = JSON.parse(Buffer.from(encodedPayload, 'base64url').toString());
-    if (payload.exp < Math.floor(Date.now() / 1000)) throw new Error('Token expired');
+    if (checkSig !== signature) throw new Error("Invalid signature");
 
-    return payload;
+    const data = JSON.parse(Buffer.from(payload, "base64url").toString());
+
+    if (data.exp < Math.floor(Date.now() / 1000))
+        throw new Error("Token expired");
+
+    return data;
 }
 
 // ----------------------------
-//   GitHub Fetch + Caching
+//   Handler
 // ----------------------------
-let SUBS_CACHE = null;
-let SUBS_CACHE_TIME = 0;
-const CACHE_TTL = 60000;
+module.exports = async (req, res) => {
+    console.log("\n--- [validate-token] New request received ---");
 
-async function fetchSubscriptionsFromGithub(rawUrl) {
-    const now = Date.now();
-    if (SUBS_CACHE && (now - SUBS_CACHE_TIME) < CACHE_TTL) return SUBS_CACHE;
+    allowCors(req, res);
 
-    const headers = { "Authorization": `token ${process.env.GITHUB_TOKEN}` };
-    const res = await fetch(rawUrl, { headers });
+    if (req.method === "OPTIONS") return res.status(200).end();
+    if (req.method !== "POST")
+        return res.status(405).json({ success: false, error: "Only POST is allowed" });
 
-    if (!res.ok) throw new Error(`GitHub fetch failed: ${res.status}`);
+    // check token
+    const auth = req.headers.authorization;
+    if (!auth || !auth.startsWith("Bearer "))
+        return res.status(401).json({ success: false, error: "Missing Authorization header" });
 
-    const json = await res.json();
-    SUBS_CACHE = json;
-    SUBS_CACHE_TIME = now;
-    return json;
-}
+    const token = auth.split(" ")[1];
 
-// ----------------------------
-//       MAIN HANDLER
-// ----------------------------
-module.exports = async (request, response) => {
-    console.log("\n--- [validate-token] Received a new request ---");
-    allowCors(request, response);
-
-    response.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
-    response.setHeader('Pragma', 'no-cache');
-    response.setHeader('Expires', '0');
-
-    if (request.method === 'OPTIONS') return response.status(200).end();
-    if (request.method !== 'POST') return response.status(405).json({ success: false, error: 'Only POST is allowed' });
-
-    const JWT_SECRET = process.env.JWT_SECRET;
-    if (!JWT_SECRET) return response.status(500).json({ success: false, error: 'Server configuration error.' });
+    const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+    const JWT_SECRET   = process.env.JWT_SECRET;
 
     try {
-        const authHeader = request.headers.authorization;
-        if (!authHeader || !authHeader.startsWith('Bearer '))
-            return response.status(401).json({ success: false, error: 'Authorization header missing.' });
+        console.log("[validate-token] Verifying token…");
 
-        const token = authHeader.split(' ')[1];
-        const payload = await verifyToken(token, JWT_SECRET);
-        const rin = payload.rin;
-        console.log(`[validate-token] Token valid for RIN: ${rin}`);
+        const payload = verifyToken(token, JWT_SECRET);
 
-        const RAW_URL = "https://raw.githubusercontent.com/ms0223048/eta-subscriptions/main/subscriptions.json";
-        const data = await fetchSubscriptionsFromGithub(RAW_URL);
+        console.log("[validate-token] Token valid for RIN:", payload.rin);
 
-        // مقارنة RIN بشكل صحيح بغض النظر عن النوع
-        const userSubscription = (data.subscriptions || []).find(sub => String(sub.rin) === String(rin));
+        console.log("[validate-token] Fetching subscriptions.json from GitHub…");
 
-        if (!userSubscription) {
-            console.log(`[validate-token] Access Denied: User not found in subscriptions.json`);
-            return response.status(401).json({ success: false, error: 'Subscription is no longer valid.' });
+        const githubRes = await fetch(
+            "https://raw.githubusercontent.com/ms0223048/eta-subscriptions/main/subscriptions.json",
+            { headers: { Authorization: `token ${GITHUB_TOKEN}` } }
+        );
+
+        const data = await githubRes.json();
+
+        const sub = data.subscriptions.find(s => String(s.rin) === String(payload.rin));
+
+        if (!sub) {
+            console.log("[validate-token] ERROR: RIN not found");
+            return res.status(401).json({ success: false, error: "Subscription not found" });
         }
 
-        if (new Date(userSubscription.expiry_date) < new Date()) {
-            console.log(`[validate-token] Access Denied: Subscription expired for RIN: ${rin}`);
-            return response.status(401).json({ success: false, error: 'Subscription has expired.' });
-        }
+        console.log("[validate-token] Subscription valid.");
 
-        console.log(`[validate-token] Subscription valid. Returning JSON data.`);
-
-        return response.status(200).json({
+        return res.status(200).json({
             success: true,
-            data: userSubscription
+            data: sub
         });
 
-    } catch (error) {
-        console.error("[validate-token] ERROR:", error.message);
-        return response.status(401).json({ success: false, error: error.message });
+    } catch (err) {
+        console.log("[validate-token] ERROR:", err.message);
+        return res.status(401).json({ success: false, error: err.message });
     }
 };
