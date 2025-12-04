@@ -1,76 +1,67 @@
-const fs = require('fs');
-const path = require('path');
-
-const allowCors = (req, res) => {
-    res.setHeader('Access-Control-Allow-Credentials', 'true');
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-};
-
-// ----------------------------
-// Token Verification
-// ----------------------------
-async function verifyToken(token, secret) {
-    const [headerB64, payloadB64, signature] = token.split('.');
-    if (!headerB64 || !payloadB64 || !signature) throw new Error('Invalid token format');
-
-    const crypto = require('crypto');
-    const data = `${headerB64}.${payloadB64}`;
-    const expectedSig = crypto.createHmac('sha256', secret).update(data).digest('base64url');
-
-    if (signature !== expectedSig) throw new Error('Invalid signature');
-
-    const payload = JSON.parse(Buffer.from(payloadB64, 'base64url').toString());
-    if (payload.exp < Math.floor(Date.now() / 1000)) throw new Error('Token expired');
-
-    return payload;
-}
-
-// ----------------------------
-// Main Handler
-// ----------------------------
-module.exports = async (req, res) => {
-    allowCors(req, res);
-    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
-    res.setHeader('Pragma', 'no-cache');
-    res.setHeader('Expires', '0');
-
-    if (req.method === 'OPTIONS') return res.status(200).end();
-    if (req.method !== 'POST') return res.status(405).json({ success: false, error: 'Only POST allowed' });
-
-    const JWT_SECRET = process.env.JWT_SECRET;
-    if (!JWT_SECRET) return res.status(500).json({ success: false, error: 'JWT_SECRET missing' });
+async function checkSubscription() {
+    const SESSION_KEY = 'eta_extension_active_session';
 
     try {
-        const authHeader = req.headers.authorization;
-        if (!authHeader || !authHeader.startsWith('Bearer ')) {
-            return res.status(401).json({ success: false, error: 'Authorization header missing.' });
+        console.log("===== STEP 1: Get current issuer data =====");
+        const currentIssuerData = await getIssuerFullData();
+        if (!currentIssuerData || !currentIssuerData.id) return null;
+        const currentRin = currentIssuerData.id;
+        console.log("Current RIN:", currentRin);
+
+        console.log("===== STEP 2: Check stored session =====");
+        const storedSessionRaw = sessionStorage.getItem(SESSION_KEY);
+        if (storedSessionRaw) {
+            const storedSession = JSON.parse(storedSessionRaw);
+            console.log("Stored session found:", storedSession);
+
+            if (storedSession.rin === currentRin && storedSession.token) {
+                const validationResponse = await fetch(
+                    'https://subscriptions-tan-two.vercel.app/api/validate-token',
+                    {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Authorization': `Bearer ${storedSession.token}`
+                        }
+                    }
+                );
+                console.log("Token response status:", validationResponse.status);
+                const validationResult = await validationResponse.json();
+                console.log("Token request result:", validationResult);
+
+                if (validationResponse.ok && validationResult.success) {
+                    return { seller: currentIssuerData, devices: [] };
+                }
+            }
+        } else {
+            console.log("No stored session found");
         }
 
-        const token = authHeader.split(' ')[1];
-        const payload = await verifyToken(token, JWT_SECRET);
-        const rin = payload.rin;
+        console.log("===== STEP 3: Request new token =====");
+        sessionStorage.removeItem(SESSION_KEY);
 
-        // ---- اقرأ JSON محلي مباشر ----
-        const subscriptionsPath = path.join(__dirname, 'subscriptions.json');
-        const raw = fs.readFileSync(subscriptionsPath);
-        const data = JSON.parse(raw);
+        const tokenResponse = await fetch(
+            'https://subscriptions-tan-two.vercel.app/api/check-subscription',
+            {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ rin: currentRin })
+            }
+        );
+        console.log("Token response status:", tokenResponse.status);
+        const tokenResult = await tokenResponse.json();
+        console.log("Token request result:", tokenResult);
 
-        const sub = (data.subscriptions || []).find(s => s.rin === rin);
+        if (!tokenResult.success || !tokenResult.session_token) return null;
 
-        // ---- رفض فوري لو الرقم غير موجود أو الاشتراك انتهى ----
-        if (!sub) return res.status(401).json({ success: false, error: 'Subscription is no longer valid.' });
-        if (new Date(sub.expiry_date) < new Date()) return res.status(401).json({ success: false, error: 'Subscription expired.' });
+        const newSession = { rin: currentRin, token: tokenResult.session_token };
+        sessionStorage.setItem(SESSION_KEY, JSON.stringify(newSession));
 
-        // ---- لو كل شيء تمام ----
-        return res.status(200).json({
-            success: true,
-            data: sub
-        });
+        return { seller: currentIssuerData, devices: [] };
 
-    } catch (err) {
-        console.error('[validate-token] ERROR:', err.message);
-        return res.status(401).json({ success: false, error: err.message });
+    } catch (error) {
+        console.error("Subscription check ERROR:", error);
+        sessionStorage.removeItem(SESSION_KEY);
+        return null;
     }
-};
+}
